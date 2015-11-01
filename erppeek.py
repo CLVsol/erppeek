@@ -22,30 +22,15 @@ try:                    # Python 3
     import configparser
     from threading import current_thread
     from xmlrpc.client import Fault, ServerProxy
-    basestring = str
-    int_types = int
-    _DictWriter = csv.DictWriter
+    PY2 = False
 except ImportError:     # Python 2
     import ConfigParser as configparser
     from threading import currentThread as current_thread
     from xmlrpclib import Fault, ServerProxy
-    int_types = int, long
-
-    class _DictWriter(csv.DictWriter):
-        """Unicode CSV Writer, which encodes output to UTF-8."""
-
-        def writeheader(self):
-            # Method 'writeheader' does not exist in Python 2.6
-            header = dict(zip(self.fieldnames, self.fieldnames))
-            self.writerow(header)
-
-        def _dict_to_list(self, rowdict):
-            rowlst = csv.DictWriter._dict_to_list(self, rowdict)
-            return [cell.encode('utf-8') if hasattr(cell, 'encode') else cell
-                    for cell in rowlst]
+    PY2 = True
 
 
-__version__ = '1.6.1'
+__version__ = '1.6.2'
 __all__ = ['Client', 'Model', 'Record', 'RecordList', 'Service',
            'format_exception', 'read_config', 'start_odoo_services']
 
@@ -113,6 +98,26 @@ _obsolete_methods = {
 }
 _cause_message = ("\nThe above exception was the direct cause "
                   "of the following exception:\n\n")
+
+if PY2:
+    int_types = int, long
+
+    class _DictWriter(csv.DictWriter):
+        """Unicode CSV Writer, which encodes output to UTF-8."""
+
+        def writeheader(self):
+            # Method 'writeheader' does not exist in Python 2.6
+            header = dict(zip(self.fieldnames, self.fieldnames))
+            self.writerow(header)
+
+        def _dict_to_list(self, rowdict):
+            rowlst = csv.DictWriter._dict_to_list(self, rowdict)
+            return [cell.encode('utf-8') if hasattr(cell, 'encode') else cell
+                    for cell in rowlst]
+else:   # Python 3
+    basestring = str
+    int_types = int
+    _DictWriter = csv.DictWriter
 
 
 def _memoize(inst, attr, value, doc_values=None):
@@ -341,13 +346,15 @@ class Service(object):
     _rpcpath = ''
     _methods = ()
 
-    def __init__(self, server, endpoint, methods, verbose=False):
+    def __init__(self, server, endpoint, methods,
+                 transport=None, verbose=False):
         if isinstance(server, basestring):
             self._rpcpath = rpcpath = server + '/xmlrpc/'
-            proxy = ServerProxy(rpcpath + endpoint, allow_none=True)
-            self._dispatch = proxy._ServerProxy__request
+            proxy = ServerProxy(rpcpath + endpoint,
+                                transport=transport, allow_none=True)
             if hasattr(proxy._ServerProxy__transport, 'close'):   # >= 2.7
                 self.close = proxy._ServerProxy__transport.close
+            self._dispatch = proxy._ServerProxy__request
         elif server._api_v7:
             proxy = server.netsvc.ExportService.getService(endpoint)
             self._dispatch = proxy.dispatch
@@ -414,7 +421,7 @@ class Client(object):
     _config_file = os.path.join(os.curdir, CONF_FILE)
 
     def __init__(self, server, db=None, user=None, password=None,
-                 verbose=False):
+                 transport=None, verbose=False):
         if isinstance(server, basestring) and server[-1:] == '/':
             server = server.rstrip('/')
         elif isinstance(server, list):
@@ -427,7 +434,7 @@ class Client(object):
             methods = list(_methods[name]) if (name in _methods) else []
             if float_version < 8.0:
                 methods += _obsolete_methods.get(name) or ()
-            return Service(server, name, methods, verbose=verbose)
+            return Service(server, name, methods, transport, verbose=verbose)
         self.server_version = ver = get_proxy('db').server_version()
         self.major_version = re.match('\d+\.?\d*', ver).group()
         float_version = float(self.major_version)
@@ -748,17 +755,34 @@ class Client(object):
 
     def _upgrade(self, modules, button):
         # First, update the list of modules
-        updated, added = self.execute('ir.module.module', 'update_list')
+        ir_module = self.model('ir.module.module', False)
+        updated, added = ir_module.update_list()
         if added:
             print('%s module(s) added to the list' % added)
         # Find modules
-        ids = modules and self.search('ir.module.module',
-                                      [('name', 'in', modules)])
+        ids = modules and ir_module.search([('name', 'in', modules)])
         if ids:
-            # Click upgrade/install/uninstall button
-            self.execute('ir.module.module', button, ids)
-        mods = self.read('ir.module.module',
-                         [('state', 'not in', STABLE_STATES)], 'name state')
+            # Safety check
+            mods = ir_module.read([('state', 'not in', STABLE_STATES)], 'name state')
+            if mods:
+                raise Error('Pending actions:\n' + '\n'.join(
+                    ('  %(state)s\t%(name)s' % mod) for mod in mods))
+            if button == 'button_uninstall':
+                # Safety check
+                names = ir_module.read([('id', 'in', ids),
+                                        'state != installed'], 'name')
+                if names:
+                    raise Error('Not installed: %s' % ', '.join(names))
+                # A trick to uninstall dependent add-ons
+                ir_module.write(ids, {'state': 'to remove'})
+            try:
+                # Click upgrade/install/uninstall button
+                self.execute('ir.module.module', button, ids)
+            except Exception:
+                if button == 'button_uninstall':
+                    ir_module.write(ids, {'state': 'installed'})
+                raise
+        mods = ir_module.read([('state', 'not in', STABLE_STATES)], 'name state')
         if not mods:
             if ids:
                 print('Already up-to-date: %s' %
@@ -1312,6 +1336,10 @@ class RecordList(object):
             msg = "has no attribute %r"
         raise AttributeError("'RecordList' object %s" % msg % attr)
 
+    def __eq__(self, other):
+        return (isinstance(other, RecordList) and
+                self.id == other.id and self._model is other._model)
+
 
 class Record(object):
     """A class for all Odoo records.
@@ -1347,6 +1375,12 @@ class Record(object):
 
     def __str__(self):
         return self._name
+
+    if PY2:
+        __unicode__ = __str__
+
+        def __str__(self):
+            return self._name.encode('ascii', 'backslashreplace')
 
     def _get_name(self):
         try:
